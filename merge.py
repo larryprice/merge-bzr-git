@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import logging
 import os
 import re
 import shlex
@@ -9,9 +10,25 @@ import subprocess
 import sys
 
 
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger("merge-bzr-git")
+
+
 class Arguments(object):
     def __init__(self, args):
         self._parse(args)
+
+    @property
+    def bzr_dir(self):
+        return self._args.bzr_dir
+
+    @property
+    def git_dir(self):
+        return self._args.git_dir
+
+    @property
+    def revision(self):
+        return int(self._args.start_revision)
 
     def _parse(self, args):
         parser = argparse.ArgumentParser(description='Merge bazaar revisions into git repository using diffs')
@@ -26,11 +43,11 @@ class Arguments(object):
 
     def validate(self):
         if not os.path.exists(self._args.bzr_dir):
-            print("No such directory: '{bzr_dir}'".format(bzr_dir=self._args.bzr_dir))
+            logger.error("No such directory: '{bzr_dir}'".format(bzr_dir=self._args.bzr_dir))
             sys.exit(1)
 
         if not os.path.exists(self._args.git_dir):
-            print("No such directory: '{git_dir}'".format(git_dir=self._args.git_dir))
+            logger.error("No such directory: '{git_dir}'".format(git_dir=self._args.git_dir))
             sys.exit(1)
 
 
@@ -40,6 +57,12 @@ class CurrentWorkingDirectory(contextlib.ExitStack):
         cwd = os.getcwd()
         os.chdir(newcwd)
         self.callback(lambda: os.chdir(cwd))
+
+
+class CommitOutOfRangeException(Exception):
+    def __init__(self, revision):
+        super(self).__init__("Revision '{revision_id}' is not a valid commit in this repository".format(revision_id=revision))
+        self.revision = revision
 
 
 class BzrCommit(object):
@@ -54,6 +77,8 @@ class BzrCommit(object):
         self._parse_log(revision)
 
     def _fetch_diff(self, revision):
+        logger.debug("fetching diff...")
+
         bzr_diff = subprocess.Popen(shlex.split('bzr diff -c{} --format git'.format(revision)), stdout=subprocess.PIPE)
         out, err = bzr_diff.communicate()
         if bzr_diff.returncode != 1:
@@ -72,9 +97,13 @@ class BzrCommit(object):
                 self.diff += line + '\n'
 
     def _parse_log(self, revision):
+        logger.debug("parsing log...")
+
         bzr_log = subprocess.Popen(shlex.split('bzr log -r {revision}'.format(revision=revision)), stdout=subprocess.PIPE)
         out, err = bzr_log.communicate()
         if bzr_log.returncode != 0:
+            if bzr_log.returncode == 3:
+                raise CommitOutOfRangeException(revision)
             raise Exception("unexpected exit code from bzr during log")
 
         recording_message = False
@@ -104,23 +133,31 @@ class GitCommit(object):
         pass
 
     def apply(self, diff_data):
+        logger.debug("applying patch...")
+
         git_patch = subprocess.Popen(shlex.split('git apply'), stdin=subprocess.PIPE)
         git_patch.communicate(input=diff_data.encode('utf-8'))
         if git_patch.returncode != 0:
             raise Exception("unexpected exit code from git during apply")
 
     def add_all_files(self):
+        logger.debug("adding all files to current commit...")
+
         if subprocess.Popen(shlex.split('git add .')).wait() != 0:
             raise Exception("unexpected exit code from git during add")
 
     def commit(self, message, author, committer, timestamp):
+        logger.debug("committing...")
+
         environ = os.environ.copy()
         environ['GIT_COMMITTER_NAME'] = committer['name']
         environ['GIT_COMMITTER_EMAIL'] = committer['email']
         environ['GIT_COMMITTER_DATE'] = timestamp
-        if subprocess.Popen(shlex.split('git commit --message="{message}" --author="{author}" --date="{date}"'.format(
-                                        author=author, date=timestamp, message=message)), env=environ).wait() != 0:
-            raise Exception("unexpected exit code from git during commit")
+
+        with open(os.devnull, 'w') as fp:
+            if subprocess.Popen(shlex.split('git commit --message="{message}" --author="{author}" --date="{date}"'.format(
+                                            author=author, date=timestamp, message=message)), env=environ, stdout=fp).wait() != 0:
+                raise Exception("unexpected exit code from git during commit")
 
 
 if __name__ == '__main__':
@@ -129,17 +166,31 @@ if __name__ == '__main__':
 
     with open(os.devnull, 'w') as fp:
         if subprocess.Popen(shlex.split('which bzr'), stdout=fp).wait() != 0:
-            print("Failed to find bzr binary on this system.")
+            logger.error("Failed to find bzr binary on this system.")
             sys.exit(2)
 
         if subprocess.Popen(shlex.split('which git'), stdout=fp).wait() != 0:
-            print("Failed to find git binary on this system.")
+            logger.error("Failed to find git binary on this system.")
             sys.exit(2)
 
-    with CurrentWorkingDirectory(args._args.bzr_dir):
-        bzr = BzrCommit(args._args.start_revision)
-        with CurrentWorkingDirectory(args._args.git_dir):
-            git = GitCommit()
-            git.apply(bzr.diff)
-            git.add_all_files()
-            git.commit(bzr.message, bzr.author, bzr.committer, bzr.timestamp)
+    with CurrentWorkingDirectory(args.bzr_dir):
+        try:
+            revision = args.revision
+            while True:
+                logger.debug("revision: {revision_id}".format(revision_id=revision))
+
+                bzr = BzrCommit(revision)
+                with CurrentWorkingDirectory(args.git_dir):
+                    git = GitCommit()
+                    git.apply(bzr.diff)
+                    git.add_all_files()
+                    git.commit(bzr.message, bzr.author, bzr.committer, bzr.timestamp)
+
+                revision += 1
+
+        except CommitOutOfRangeException as e:
+            logger.info("Done! Final commit was:", e.revision-1)
+            sys.exit(0)
+
+        except Exception as e:
+            logger.exception(e)
